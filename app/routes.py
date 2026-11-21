@@ -17,15 +17,17 @@ EDITORIAL_STORE_LOCK = RLock()
 
 def repository():
     if 'genealogy_repository' not in g:
-        from copy import deepcopy
-        # A request owns its name snapshot; concurrent imports cannot mutate it.
+        # Each name snapshot gets its own repository, keyed by the forms, so a
+        # concurrent import produces a new object instead of mutating this one.
+        # Requests share it read-only: copying it per request cost seconds on a
+        # large tree and threw away the derived caches (validation, branches).
         path = current_app.config.get('EDITORIAL_DB_PATH')
         forms = ()
         if path and Path(path).is_file():
             forms = tuple((person_id, tuple((row['type'], row['text']) for row in rows))
                           for person_id, rows in sorted(_load_editorial_store(path).all_name_forms().items()))
-        g.genealogy_repository = deepcopy(_load_named_repository(
-            current_app.config['GEDCOM_PATH'], current_app.config['SHOW_LIVING'], forms))
+        g.genealogy_repository = _load_named_repository(
+            current_app.config['GEDCOM_PATH'], current_app.config['SHOW_LIVING'], forms)
     return g.genealogy_repository
 
 
@@ -36,7 +38,9 @@ def _load_named_repository(path, show_living, forms):
     repo.apply_name_forms({person_id: [{'type': kind, 'text': text} for kind, text in rows]
                            for person_id, rows in forms})
     repo._search_names()
-    return repo
+    # Validate once here so no visitor request pays for the whole-tree audit.
+    repo.research_review("")
+    return repo.freeze()
 
 
 @lru_cache(maxsize=4)

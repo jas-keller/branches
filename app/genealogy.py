@@ -312,6 +312,11 @@ class GedcomRepository:
         self.families: dict[str, Family] = {}
         self.sources: dict[str, Source] = {}
         self._branch_context_cache = {}
+        self._anchor_tree_cache = {}
+        self._anchor_ancestor_cache = {}
+        self._anchor_people_cache = None
+        self._people_index_cache = None
+        self._frozen = False
         self._stream_cache = {}
         self._research_review_cache = None
         self._parse()
@@ -460,9 +465,15 @@ class GedcomRepository:
         return grandparents
 
     def _grandparent_anchors(self):
-        named = [person for name in profile.BRANCH_ANCHORS
-                 if (person := self._person_by_name(name))]
-        return named or self._legacy_grandparent_anchors()
+        # Matching a name scans the whole tree, and this runs once per person on
+        # directory pages, so remember the result for the current anchor list.
+        key = tuple(profile.BRANCH_ANCHORS)
+        if self._anchor_people_cache and self._anchor_people_cache[0] == key:
+            return list(self._anchor_people_cache[1])
+        named = [person for name in key if (person := self._person_by_name(name))]
+        anchors = named or self._legacy_grandparent_anchors()
+        self._anchor_people_cache = (key, tuple(anchors))
+        return list(anchors)
 
     def branch_slots(self):
         """Stable colour/layout slot for each branch label, in anchor order."""
@@ -550,6 +561,10 @@ class GedcomRepository:
         if changed:
             self._name_search_index = None
             self._branch_context_cache.clear()
+            self._anchor_tree_cache.clear()
+            self._anchor_ancestor_cache.clear()
+            self._anchor_people_cache = None
+            self._people_index_cache = None
             self._stream_cache.clear()
 
     def _search_names(self):
@@ -865,35 +880,13 @@ class GedcomRepository:
             self._branch_context_cache[person_id] = None
             return None
 
-        def neighbors(node_id):
-            person = self.people.get(node_id)
-            if not person:
-                return []
-            result = []
-            if person.child_family and (family := self.families.get(person.child_family)):
-                result.extend(parent_id for parent_id in (family.husband, family.wife) if parent_id)
-            for family_id in person.spouse_families:
-                if family := self.families.get(family_id):
-                    result.extend(child_id for child_id in family.children if child_id)
-                    spouse_id = family.wife if family.husband == node_id else family.husband
-                    if spouse_id:
-                        result.append(spouse_id)
-            return result
-
+        # The shortest path from the nearest anchor; on a tie the earlier anchor
+        # in BRANCH_ANCHORS wins.
         best = None
         for anchor_id in anchors:
-            queue = deque([(anchor_id, [anchor_id])])
-            seen = set()
-            while queue:
-                node_id, path = queue.popleft()
-                if node_id in seen or len(path) > 24:
-                    continue
-                seen.add(node_id)
-                if node_id == person_id:
-                    if best is None or len(path) < len(best):
-                        best = path
-                    break
-                queue.extend((neighbor, path + [neighbor]) for neighbor in neighbors(node_id) if neighbor not in seen)
+            path = self._anchor_path(anchor_id, person_id)
+            if path and (best is None or len(path) < len(best)):
+                best = path
         if not best:
             self._branch_context_cache[person_id] = None
             return None
@@ -922,6 +915,77 @@ class GedcomRepository:
         self._branch_context_cache[person_id] = result
         return result
 
+    # A branch trail is at most this many people long, anchor included.
+    _BRANCH_PATH_LIMIT = 24
+
+    def _family_neighbors(self, node_id):
+        """Parents, then each family's children and spouse, in GEDCOM order."""
+        person = self.people.get(node_id)
+        if not person:
+            return []
+        result = []
+        if person.child_family and (family := self.families.get(person.child_family)):
+            result.extend(parent_id for parent_id in (family.husband, family.wife) if parent_id)
+        for family_id in person.spouse_families:
+            if family := self.families.get(family_id):
+                result.extend(child_id for child_id in family.children if child_id)
+                spouse_id = family.wife if family.husband == node_id else family.husband
+                if spouse_id:
+                    result.append(spouse_id)
+        return result
+
+    def _anchor_tree(self, anchor_id):
+        """Breadth-first predecessor map from one anchor, computed once.
+
+        Searching from every anchor for every person made directory pages
+        quadratic in tree size. One search per anchor gives every person's
+        shortest path, and the first-discovered predecessor reproduces the path
+        a per-person search would have found.
+        """
+        tree = self._anchor_tree_cache.get(anchor_id)
+        if tree is not None:
+            return tree
+        tree = {anchor_id: None}
+        depth = {anchor_id: 1}
+        queue = deque([anchor_id])
+        while queue:
+            node_id = queue.popleft()
+            if depth[node_id] >= self._BRANCH_PATH_LIMIT:
+                continue
+            for neighbor in self._family_neighbors(node_id):
+                if neighbor not in tree:
+                    tree[neighbor] = node_id
+                    depth[neighbor] = depth[node_id] + 1
+                    queue.append(neighbor)
+        self._anchor_tree_cache[anchor_id] = tree
+        return tree
+
+    def _anchor_path(self, anchor_id, person_id):
+        tree = self._anchor_tree(anchor_id)
+        if person_id not in tree:
+            return None
+        path = [person_id]
+        while (previous := tree[path[-1]]) is not None:
+            path.append(previous)
+        path.reverse()
+        return path
+
+    def _anchor_ancestor_depths(self, anchor_id):
+        """Generations from an anchor to each of their direct ancestors."""
+        depths = self._anchor_ancestor_cache.get(anchor_id)
+        if depths is not None:
+            return depths
+        depths = {anchor_id: 0}
+        queue = deque([anchor_id])
+        while queue:
+            node_id = queue.popleft()
+            for parent_id in self._parent_ids(node_id):
+                if parent_id not in depths:
+                    depths[parent_id] = depths[node_id] + 1
+                    queue.append(parent_id)
+        self._anchor_ancestor_cache[anchor_id] = depths
+        return depths
+
     def anchor_relationship(self, person_id, branch=None):
         """Describe a person's relationship to the grandparent anchoring a branch.
 
@@ -938,18 +1002,7 @@ class GedcomRepository:
             return ""
 
         familiar_name = anchor.display_name
-        queue = deque([(anchor.id, 0)])
-        seen = set()
-        generations = None
-        while queue:
-            node_id, depth = queue.popleft()
-            if node_id in seen:
-                continue
-            seen.add(node_id)
-            if node_id == person_id:
-                generations = depth
-                break
-            queue.extend((parent_id, depth + 1) for parent_id in self._parent_ids(node_id))
+        generations = self._anchor_ancestor_depths(anchor.id).get(person_id)
 
         if generations is None:
             return f"Connected to {familiar_name}'s {anchor.formal_surname or 'family'} branch"
@@ -1118,8 +1171,26 @@ class GedcomRepository:
         """Every public relative grouped by surname, with facets for browsing.
 
         Search only helps a visitor who already knows a name. This is the way in
-        for someone who does not.
+        for someone who does not. A frozen repository builds it once (several
+        pages and the homepage read it); callers must treat it as read-only.
         """
+        if not self._frozen:
+            return self._build_people_index()
+        if self._people_index_cache is None:
+            self._people_index_cache = self._build_people_index()
+        return self._people_index_cache
+
+    def freeze(self):
+        """Promise no further edits, so whole-tree views can be built once.
+
+        The web app freezes the repository it serves. Code that edits people or
+        events in place (imports, tests) leaves it unfrozen and always sees
+        fresh results.
+        """
+        self._frozen = True
+        return self
+
+    def _build_people_index(self):
         groups = defaultdict(list)
         branches = Counter()
         countries = Counter()
