@@ -158,6 +158,9 @@ approval:
 
 ## Deployment
 
+See [how I host Flask apps on DreamHost](docs/dreamhost/flask-hosting.md) for the
+deployment overview.
+
 `wsgi.py` exposes the app for any WSGI server; `passenger_wsgi.py` suits
 Passenger hosts, and `gunicorn.conf.py` binds to `GUNICORN_BIND` (default
 `0.0.0.0:8005`) behind a reverse proxy. Keep `BRANCHES_SHOW_LIVING` unset on a
